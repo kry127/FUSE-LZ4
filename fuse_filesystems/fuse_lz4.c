@@ -70,6 +70,7 @@
 #include <sys/xattr.h>
 
 #include "passthrough_helpers.h"
+#include "lz4_block_descriptor.h"
 
 /* We are re-using pointers to our `struct lo_inode` and `struct
    lo_dirp` elements as inodes. This means that we must be able to
@@ -894,18 +895,130 @@ static void lo_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 	fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
+static ssize_t decompress(char * compressed_data, char **regen_buffer, struct lz4_block_descriptor *bd) {
+  *regen_buffer = malloc(bd->data_size);
+  if (*regen_buffer == NULL)
+    return -1;
+  int decompressed_size = LZ4_decompress_safe(compressed_data, *regen_buffer,
+  					bd->block_size - sizeof(struct lz4_block_descriptor), bd->data_size);
+  if (decompressed_size < 0) {
+	fuse_log(FUSE_LOG_DEBUG, "\nFuse decompression error: %d\n", decompressed_size);
+    return decompressed_size;
+  }
+
+  // deciphered data differ -- error?
+//   if (decompressed_size != bd->data_size)
+//     return -2;
+
+  // return size of deciphered data
+  return decompressed_size;
+}
+
+
+// буфер и функция для чтения холостых данных
+const size_t lo_read_buffer_size = 1024;
+char lo_read_buffer[1024];
+
+ssize_t cycled_ignore_read(uint64_t fd, size_t szsz) {
+	ssize_t buf_szsz = 0;
+	while (szsz != 0) {
+		if (szsz < lo_read_buffer_size) {
+			buf_szsz = read(fd, lo_read_buffer, szsz);
+		} else {
+			buf_szsz = read(fd, lo_read_buffer, szsz);
+		}
+		if (buf_szsz <= 0) return buf_szsz;
+		szsz -= buf_szsz;
+	}
+}
+
 static void lo_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 		    off_t offset, struct fuse_file_info *fi)
 {
-	struct fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
+	// remember position of the file
+	//unsigned long position = ftell(fi->fh);
+
+	// empty buf for eof and other stuff
+	struct fuse_bufvec buf_empty = FUSE_BUFVEC_INIT(0);
+
+	lseek(fi->fh, 0, SEEK_SET);
+	struct lz4_block_descriptor descriptor;
+	ssize_t start_offset = 0; // будем искать, в каком месте блоки
+	// read LZ4 blocks
+	fuse_log(FUSE_LOG_DEBUG, "A");
+	size_t block_number = 0;
+	while(true) {
+		// remember current position in file
+		// This is CORE DUMP, do not use ftell on nonseekable:
+		// unsigned long position = ftell(fi->fh); // segmentation fault here
+
+		// read descriptor
+		ssize_t res = read(fi->fh, &descriptor, sizeof(struct lz4_block_descriptor));
+		if (res == 0) {
+			// return empty buffer on eof
+			fuse_reply_data(req, &buf_empty, FUSE_BUF_SPLICE_MOVE);
+			return;
+		} else if (res < 0) {
+			// on error -- reply error
+			fuse_reply_err(req, ENODATA);
+		}
+
+		if (offset < start_offset + descriptor.data_size) {
+			// found starting block!
+			fuse_log(FUSE_LOG_DEBUG, "\nFound block number %u\n", block_number);
+			break;
+		}
+		// else try to find next block
+		fuse_log(FUSE_LOG_DEBUG, ">");
+		start_offset += descriptor.data_size;
+		// move to next data destination
+
+		size_t szsz = descriptor.block_size - sizeof(struct lz4_block_descriptor);
+		cycled_ignore_read(fi->fh, szsz);
+	}
+
+	size_t size_to_read = descriptor.block_size - sizeof(struct lz4_block_descriptor);
+	fuse_log(FUSE_LOG_DEBUG, "Block size = %u, size to read = %u\n"
+				, descriptor.block_size, size_to_read);
+
+	char *compressed_read_buffer = malloc(size_to_read);
+	ssize_t buf_sz = read(fi->fh, compressed_read_buffer, size_to_read);
+	fuse_log(FUSE_LOG_DEBUG, "Actually read = %u\n", buf_sz);
+
+	// check we've read whole block to decrypt
+	if (buf_sz == 0) {
+		fuse_log(FUSE_LOG_DEBUG, "B1 %d", buf_sz);
+		// return empty buffer on eof
+		fuse_reply_data(req, &buf_empty, FUSE_BUF_SPLICE_MOVE);
+		return;
+	} else if (buf_sz < 0 || buf_sz != size_to_read) {
+		fuse_log(FUSE_LOG_DEBUG, "B2 %d", buf_sz);
+		// on error -- reply error
+		// just tell there is no data in file
+		fuse_reply_err(req, ENODATA);
+		return;
+	}
+	fuse_log(FUSE_LOG_DEBUG, "C");
+
+	// decompress the block using LZ4
+	char *decompressed;
+	ssize_t sz = decompress(compressed_read_buffer, &decompressed, &descriptor);
+	if (sz < 0) {
+		// just tell there is no data in file on error
+		fuse_reply_err(req, ENODATA);
+		return;
+	}
+	//fuse_log(FUSE_LOG_DEBUG, "\nDecompressed data = '%s'", decompressed);
+
+	struct fuse_bufvec buf = FUSE_BUFVEC_INIT(sz);
+	buf.buf[0].flags &= ~FUSE_BUF_IS_FD; // NOT file descriptor
+	buf.buf[0].mem = decompressed;
+	buf.buf[0].size = sz;
 
 	if (lo_debug(req))
 		fuse_log(FUSE_LOG_DEBUG, "lo_read(ino=%" PRIu64 ", size=%zd, "
 			"off=%lu)\n", ino, size, (unsigned long) offset);
 
-	buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
-	buf.buf[0].fd = fi->fh;
-	buf.buf[0].pos = offset;
 
 	fuse_reply_data(req, &buf, FUSE_BUF_SPLICE_MOVE);
 }
@@ -914,6 +1027,8 @@ static int64_t compress(struct fuse_bufvec *in_buf, char **compressed) {
 	struct fuse_buf fb = in_buf->buf[0];
 	ssize_t sz = fuse_buf_size(in_buf);
 	char *mem = (char *)fb.mem;
+	struct lz4_block_descriptor descriptor;
+	descriptor.data_size = sz;
 
 	const int max_dst_size = LZ4_compressBound(sz);
 
@@ -924,14 +1039,28 @@ static int64_t compress(struct fuse_bufvec *in_buf, char **compressed) {
 	int compressed_data_size = LZ4_compress_default(mem, compressed_data, sz, max_dst_size);
 	if (compressed_data_size <= 0)
 		return -1;
-	compressed_data = (char *)realloc(compressed_data, (size_t)compressed_data_size);
+	//compressed_data = (char *)realloc(compressed_data, (size_t)compressed_data_size);
+
 	if (compressed_data == NULL)
 		return -1;
-	*compressed = compressed_data;
+	
+	fuse_log(FUSE_LOG_DEBUG, "Compressed data size = %u\n", compressed_data_size);
+	descriptor.block_size = sizeof(struct lz4_block_descriptor) + compressed_data_size;
+	fuse_log(FUSE_LOG_DEBUG, "Block data size = %u\n", descriptor.block_size);
+	void* block_data = malloc(descriptor.block_size);
+	struct lz4_block_descriptor *bd = block_data;
+	*bd = descriptor;
+	memcpy(block_data + sizeof(struct lz4_block_descriptor), compressed_data, compressed_data_size);
+	free(compressed_data); // free unused memory
+
+	*compressed = block_data;
+	// char *check_decompress;
+	// ssize_t chsz = decompress(block_data + sizeof(struct lz4_block_descriptor), &check_decompress, bd);
+	// fuse_log(FUSE_LOG_DEBUG, "Decompression check = %s (size=%d)\n", check_decompress, chsz);
 	// validating the buffer
-	in_buf->buf[0].mem = compressed_data;
-	in_buf->buf[0].size = compressed_data_size;
-	return compressed_data_size;
+	in_buf->buf[0].mem = block_data;
+	in_buf->buf[0].size = descriptor.block_size;
+	return descriptor.block_size;
 }
 
 static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
